@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+lora_financial_sentiment/
+lora_financial_adapter/
+confusion_matrix_comparison.png
+experiments/results/
+.ipynb_checkpoints/
