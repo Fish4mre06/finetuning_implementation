@@ -7,7 +7,7 @@ import zipfile
 
 import pandas as pd
 import requests
-from datasets import Dataset, DatasetDict
+from datasets import Dataset, DatasetDict, load_dataset
 from sklearn.model_selection import train_test_split
 
 FPB_ZIP_URL = (
@@ -45,6 +45,28 @@ def load_financial_phrasebank(agreement: str = "all") -> Dataset:
         )
 
     return Dataset.from_list(rows)
+
+
+def load_sst2_sample(n: int = 500, seed: int = 42) -> Dataset:
+    """Stratified sample of general-domain sentiment (SST-2) for a forgetting probe.
+
+    SST-2 is binary (0=negative, 1=positive). This is out-of-domain relative to
+    the financial sentiment task, so evaluating a finance-adapted model here
+    probes catastrophic forgetting of general sentiment ability.
+
+    Returns rows with keys ``sentence`` and ``label`` to match the FPB schema.
+    Labels here use the SST-2 convention, NOT the FPB convention; the forgetting
+    probe handles mapping (positive/negative only, no neutral).
+    """
+    ds = load_dataset("SetFit/sst2", split="validation")
+    df = ds.to_pandas().rename(columns={"text": "sentence"})[["sentence", "label"]]
+
+    per_class = max(1, n // 2)
+    parts = []
+    for label_value, group in df.groupby("label"):
+        parts.append(group.sample(min(per_class, len(group)), random_state=seed))
+    sampled = pd.concat(parts).reset_index(drop=True)
+    return Dataset.from_pandas(sampled)
 
 
 def remap_dataset_labels(dataset_dict: DatasetDict, target_label2id: dict[str, int]) -> DatasetDict:

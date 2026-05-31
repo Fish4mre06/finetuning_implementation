@@ -27,7 +27,7 @@ ExperimentMethod = Literal[
     "pissa",
 ]
 
-BackboneKey = Literal["distilbert", "finbert"]
+BackboneKey = Literal["distilbert", "finbert", "finbert_tone"]
 
 
 @dataclass(frozen=True)
@@ -36,10 +36,22 @@ class ModelConfig:
     model_id: str
     lora_target_modules: list[str]
     label2id: dict[str, int]
+    # True if the checkpoint ships a task-aligned (sentiment) classification
+    # head. When False (e.g. a *-base encoder), eval_only uses a randomly
+    # initialized head and is only a chance-level floor, not a real baseline.
+    has_pretrained_head: bool = False
+    # Set when the backbone's pretraining/finetuning corpus overlaps the eval
+    # benchmark, making eval_only an in-sample (leaked) measurement rather than
+    # a zero-shot transfer baseline. Surfaced in run output and CSV.
+    contamination_note: str | None = None
 
     @property
     def id2label(self) -> dict[int, str]:
         return {v: k for k, v in self.label2id.items()}
+
+    @property
+    def is_contaminated(self) -> bool:
+        return self.contamination_note is not None
 
 
 MODEL_CONFIGS: dict[BackboneKey, ModelConfig] = {
@@ -55,8 +67,33 @@ MODEL_CONFIGS: dict[BackboneKey, ModelConfig] = {
         lora_target_modules=["query", "value"],
         # ProsusAI/finbert checkpoint label order (differs from PhraseBank export ids)
         label2id={"positive": 0, "negative": 1, "neutral": 2},
+        has_pretrained_head=True,
+        contamination_note=(
+            "ProsusAI/finbert was fine-tuned on FinancialPhraseBank; its "
+            "eval_only result (~0.97) reflects training-set overlap, not "
+            "zero-shot transfer. Treat as a leaked upper anchor, not a fair "
+            "domain baseline. Use 'finbert_tone' for a leakage-safe comparison."
+        ),
+    ),
+    "finbert_tone": ModelConfig(
+        key="finbert_tone",
+        model_id="yiyanghkust/finbert-tone",
+        lora_target_modules=["query", "value"],
+        # FinBERT-Tone checkpoint label order.
+        label2id={"neutral": 0, "positive": 1, "negative": 2},
+        # Ships a pretrained tone/sentiment head, so eval_only is a genuine
+        # zero-shot finance baseline (not a random floor).
+        has_pretrained_head=True,
+        # Trained on analyst-report / forward-looking-statement sentences, not
+        # FinancialPhraseBank -> usable as an uncontaminated finance encoder.
+        # Verify provenance before treating as fully leakage-free.
     ),
 }
+
+# Locked, shared learning rate for the trained-method comparison. head_only and
+# the LoRA family must use the SAME LR budget so that head_only-vs-lora isolates
+# the marginal value of attention adaptation rather than an LR difference.
+LOCKED_LEARNING_RATE: float = 2e-4
 
 
 def get_device() -> torch.device:
@@ -148,7 +185,7 @@ def run_experiment(
     device: torch.device,
     output_dir: str,
     num_train_epochs: int = 3,
-    learning_rate: float = 2e-4,
+    learning_rate: float = LOCKED_LEARNING_RATE,
     per_device_train_batch_size: int = 16,
     seed: int = 42,
     lora_r: int = 8,
@@ -162,6 +199,8 @@ def run_experiment(
       - lora / dora / pissa: PEFT adapters on attention modules
     """
     cfg = MODEL_CONFIGS[backbone]
+    if cfg.contamination_note:
+        print(f"  [!] CONTAMINATION: {cfg.contamination_note}")
     model = load_sequence_classifier(cfg)
 
     if method == "eval_only":
@@ -178,14 +217,26 @@ def run_experiment(
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
+    test_n = len(tokenized["test"])
+
     if method == "eval_only":
-        _, _, test_f1 = evaluate_f1_macro(
+        if cfg.is_contaminated:
+            baseline_type = "leaked_anchor"
+            floor_note = " [contaminated: in-sample, training-set overlap]"
+        elif cfg.has_pretrained_head:
+            baseline_type = "zero_shot"
+            floor_note = " [zero-shot: pretrained sentiment head, leakage-safe baseline]"
+        else:
+            baseline_type = "random_floor"
+            floor_note = " [random untrained head: chance-level floor, NOT a LoRA comparison]"
+        _, _, test_f1, ci_lo, ci_hi = evaluate_f1_macro(
             model,
             tokenized["test"],
             data_collator,
             device,
             id2label=cfg.id2label,
-            split_name=f"{experiment_id} (eval only)",
+            split_name=f"{experiment_id} (eval only){floor_note}",
+            compute_ci=True,
         )
         return {
             "experiment_id": experiment_id,
@@ -193,10 +244,16 @@ def run_experiment(
             "method": method,
             "seed": seed,
             "test_f1_macro": test_f1,
+            "test_f1_ci_lower": ci_lo,
+            "test_f1_ci_upper": ci_hi,
+            "test_n": test_n,
             "val_f1_macro": None,
             "trainable_params": trainable,
             "total_params": total,
             "trainable_pct": 0.0,
+            "contaminated": cfg.is_contaminated,
+            "baseline_type": baseline_type,
+            "learning_rate": None,
             "output_dir": None,
         }
 
@@ -231,7 +288,7 @@ def run_experiment(
     )
     trainer.train()
 
-    _, _, val_f1 = evaluate_f1_macro(
+    _, _, val_f1, _, _ = evaluate_f1_macro(
         model,
         tokenized["validation"],
         data_collator,
@@ -240,13 +297,14 @@ def run_experiment(
         verbose=False,
         split_name="val",
     )
-    _, _, test_f1 = evaluate_f1_macro(
+    _, _, test_f1, ci_lo, ci_hi = evaluate_f1_macro(
         model,
         tokenized["test"],
         data_collator,
         device,
         id2label=cfg.id2label,
         split_name=f"{experiment_id} (test)",
+        compute_ci=True,
     )
 
     pct = 100.0 * trainable / total if total else 0.0
@@ -256,9 +314,15 @@ def run_experiment(
         "method": method,
         "seed": seed,
         "test_f1_macro": test_f1,
+        "test_f1_ci_lower": ci_lo,
+        "test_f1_ci_upper": ci_hi,
+        "test_n": test_n,
         "val_f1_macro": val_f1,
         "trainable_params": trainable,
         "total_params": total,
         "trainable_pct": round(pct, 2),
+        "contaminated": cfg.is_contaminated,
+        "baseline_type": None,
+        "learning_rate": learning_rate,
         "output_dir": output_dir,
     }

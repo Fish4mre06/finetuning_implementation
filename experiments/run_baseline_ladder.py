@@ -43,12 +43,54 @@ LADDER_EXPERIMENTS: list[tuple[str, str, str]] = [
     ("distilbert_lora", "distilbert", "lora"),
     ("distilbert_dora", "distilbert", "dora"),
     ("distilbert_pissa", "distilbert", "pissa"),
+    # ProsusAI/finbert is fine-tuned on FinancialPhraseBank: eval_only here is
+    # in-sample (leaked). Kept as a labelled upper anchor, flagged contaminated.
     ("finbert_eval_only", "finbert", "eval_only"),
     ("finbert_head_only", "finbert", "head_only"),
     ("finbert_lora", "finbert", "lora"),
     ("finbert_dora", "finbert", "dora"),
     ("finbert_pissa", "finbert", "pissa"),
+    # FinBERT-Tone: finance encoder NOT trained on FPB -> leakage-safe domain
+    # comparison for the head_only-vs-lora contrast.
+    ("finbert_tone_eval_only", "finbert_tone", "eval_only"),
+    ("finbert_tone_head_only", "finbert_tone", "head_only"),
+    ("finbert_tone_lora", "finbert_tone", "lora"),
 ]
+
+# Backbones for which head_only-vs-lora is the meaningful, fair contrast
+# (same LR budget, same epochs). This isolates the marginal value of attention
+# adaptation over a trained linear head -- the real research question.
+KEY_COMPARISON_BACKBONES = ["distilbert", "finbert", "finbert_tone"]
+
+
+def _print_key_comparisons(results: pd.DataFrame) -> None:
+    """Print the honest head_only-vs-lora delta per backbone.
+
+    The headline 'eval_only -> lora' jump is mostly the value of TRAINING A HEAD
+    (eval_only uses a random/untrained head), not the value of LoRA. The fair
+    isolation of LoRA's contribution is head_only vs lora at the same LR budget.
+    """
+    print(f"\n{'=' * 60}")
+    print("KEY COMPARISON: marginal value of LoRA over a trained head")
+    print("(head_only vs lora, same LR budget -- this is the real question)")
+    print("=" * 60)
+    means = results.groupby("experiment_id")["test_f1_macro"].mean()
+    for backbone in KEY_COMPARISON_BACKBONES:
+        head_id = f"{backbone}_head_only"
+        lora_id = f"{backbone}_lora"
+        if head_id in means and lora_id in means:
+            head, lora = means[head_id], means[lora_id]
+            print(
+                f"  {backbone:13s}  head_only={head:.4f}  lora={lora:.4f}  "
+                f"delta={lora - head:+.4f}"
+            )
+    print(
+        "\nReminder: eval_only rows are NOT a LoRA baseline. DistilBERT eval_only"
+        " is a random-head chance floor; ProsusAI/finbert eval_only is an "
+        "in-sample leaked anchor (trained on FPB); FinBERT-Tone eval_only is a "
+        "leakage-safe zero-shot baseline. Do not cite 'eval_only -> lora' as the"
+        " LoRA lift -- use the head_only-vs-lora delta above."
+    )
 
 
 def main() -> None:
@@ -138,8 +180,17 @@ def main() -> None:
     results.to_csv(out_csv, index=False)
 
     summary = (
-        results.groupby("experiment_id")["test_f1_macro"]
-        .agg(["mean", "std", "min", "max"])
+        results.groupby("experiment_id")
+        .agg(
+            mean=("test_f1_macro", "mean"),
+            std=("test_f1_macro", "std"),
+            min=("test_f1_macro", "min"),
+            max=("test_f1_macro", "max"),
+            ci_lower=("test_f1_ci_lower", "mean"),
+            ci_upper=("test_f1_ci_upper", "mean"),
+            test_n=("test_n", "first"),
+            contaminated=("contaminated", "first"),
+        )
         .sort_values("mean", ascending=False)
     )
     summary_path = RESULTS_DIR / "baseline_ladder_summary.csv"
@@ -147,8 +198,16 @@ def main() -> None:
 
     print(f"\nSaved: {out_csv}")
     print(f"Saved: {summary_path}")
-    print("\nMean test F1-macro by experiment:")
+    test_n = int(results["test_n"].iloc[0]) if len(results) else 0
+    print(f"\nMean test F1-macro by experiment (test N={test_n}):")
     print(summary.to_string())
+    print(
+        "\nNote: per-seed runs report a 95% bootstrap CI; the columns above are "
+        "the mean of those CI bounds. On a test set this small, differences "
+        "smaller than the CI width are not resolvable."
+    )
+
+    _print_key_comparisons(results)
 
     meta = {
         "epochs": epochs,
